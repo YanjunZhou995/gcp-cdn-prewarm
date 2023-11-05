@@ -1,4 +1,0 @@
-config:
-  cdn_prewarm:name: pp-prod
-  cdn_prewarm:type: e2-standard-2
-  gcp:project: speedy-victory-336109
