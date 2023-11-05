@@ -1,0 +1,4 @@
+config:
+  cdn_prewarm:name: pp-dev
+  cdn_prewarm:type: e2-medium
+  gcp:project: speedy-victory-336109
