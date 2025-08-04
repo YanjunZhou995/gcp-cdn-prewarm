@@ -1,20 +1,3 @@
-import pulumi
-import pulumi_gcp as gcp
-
-config = pulumi.Config()
-type = config.require('type')
-gcs_bucket = config.require('gcs_bucket')
-num_vms = config.require('num_vms')
-
-# 在这里设置自定义超时
-long_timeout = pulumi.CustomTimeouts(create="20m")
-
-# --- 集群配置 ---
-GCS_SHARD_PREFIX = "url-shards/url_shard_"
-# 机器规格建议使用高CPU类型，因为任务是网络和CPU密集型
-
-# 注意：脚本内容保持不变，我们只在创建VM时动态传入不同的GCS路径
-startup_script_template = '''
 #!/bin/bash
 
 # --- 脚本初始化与配置 ---
@@ -78,7 +61,7 @@ fi
 
 echo "--- DEBUG 1: Final JSON Payload ---"
 
-readonly TOTAL_URLS=$(grep -c . "$URL_LIST_FILE")
+readonly TOTAL_URLS=$(wc -l < "$URL_LIST_FILE" | tr -d ' ')
 echo "TOTAL_URLS = $TOTAL_URLS"
 log_to_gcp "URL list downloaded successfully." "INFO" '{{"vm_name": "'$(hostname)'", "region": "{region}", "task_id":"{shard_suffix}", "total_urls": '$TOTAL_URLS'}}'
 
@@ -101,8 +84,8 @@ process_url() {{
         local extra_payload
         extra_payload=$(jq -n \
           --arg vm_name "$(hostname)" \
-          --arg region {region} \
-          --arg task_id {shard_suffix} \
+          --arg region "{region}" \
+          --arg task_id "{shard_suffix}" \
           --arg url "$url" \
           --arg http_code "$http_code" \
           '{{
@@ -145,7 +128,7 @@ FAILURE_COUNT=$(cat "$FAILURE_LOG" 2>/dev/null | wc -l || echo 0)
 COMPLETION_RATE=$(awk -v total="$TOTAL_URLS" -v success="$SUCCESS_COUNT" -v failure="$FAILURE_COUNT" \
   'BEGIN {{
     if (total > 0) {{
-        printf "%.2f", ((success + failure) / total) * 100
+        printf "%%.2f", ((success + failure) / total) * 100
     }} else {{
         print 0
     }}
@@ -154,7 +137,7 @@ COMPLETION_RATE=$(awk -v total="$TOTAL_URLS" -v success="$SUCCESS_COUNT" -v fail
 SUCCESS_RATE=$(awk -v total="$TOTAL_URLS" -v success="$SUCCESS_COUNT" \
   'BEGIN {{
     if (total > 0) {{
-        printf "%.2f", (success / total) * 100
+        printf "%%.2f", (success / total) * 100
     }} else {{
         print 0
     }}
@@ -169,25 +152,13 @@ echo "SUCCESS_RATE = $SUCCESS_RATE"
 # 默认为空数组。
 FAILED_URLS_SAMPLE='[]' 
 # 检查失败日志文件是否存在且不为空。
-if [ -s "$FAILURE_LOG" ]; then
-    # 步骤1: 安全地读取最多100个非空行到 Bash 数组 'urls' 中。
-    # 这种方法比长管道更稳定。
-    urls=()
-    while IFS= read -r line && [ ${{#urls[@]}} -lt 100 ]; do
-        # 如果行不为空，则添加到数组中
-        if [ -n "$line" ]; then
-            urls+=("$line")
-        fi
-    done < "$FAILURE_LOG"
-
-    # 步骤2: 如果数组中有内容，则使用 jq 将其转换为 JSON 格式。
-    # 这个转换过程是标准且可靠的。
-    if [ ${{#urls[@]}} -gt 0 ]; then
-        FAILED_URLS_SAMPLE=$(printf '%s\n' "${{urls[@]}}" | jq -R . | jq -s .)
-    fi
+if [ -s "$FAILURE_LOG" ]; then 
+    # -R: 读取原始字符串; -s: 将所有输入合并成一个数组。
+    # 'split("\n") | map(select(length > 0))': 按换行符分割并移除空行。
+    FAILED_URLS_SAMPLE=$(head -n 100 "$FAILURE_LOG" | jq -R -s 'split("\n") | map(select(length > 0))')
 fi
 
-# echo "FAILED_URLS_SAMPLE = $FAILED_URLS_SAMPLE"
+echo "FAILED_URLS_SAMPLE = $FAILED_URLS_SAMPLE"
 
 # 构建最终的摘要JSON。
 SUMMARY_PAYLOAD_BASE=$(jq -n \
@@ -218,7 +189,7 @@ SUMMARY_PAYLOAD=$(jq -n \
   --argjson sample "$FAILED_URLS_SAMPLE" \
   '$base + {{"failed_urls_sample": $sample}}')  
 
-# echo "SUMMARY_PAYLOAD = $SUMMARY_PAYLOAD"
+echo "SUMMARY_PAYLOAD = $SUMMARY_PAYLOAD"
 
 echo "--- DEBUG 4: Final JSON Payload ---"
 
@@ -232,60 +203,3 @@ log_to_gcp "Cleanup complete. Script finished." "INFO" '{{"vm_name": "'$(hostnam
 # --- (可选) 任务完成后自动销毁虚拟机 ---
 # 如果需要，可以取消下面这行的注释。请确保服务账号有删除实例的权限。
 # gcloud compute instances delete "$(hostname)" --zone="{{zone}}" --quiet
-'''
-
-# --- 循环创建10台工作虚拟机 ---
-def create_vm(region, type):
-    for i in range(int(num_vms)):
-        # 为分片文件名生成后缀（aa, ab, ac, ...）
-        # chr(ord('a') + i % 26)可以处理26个以上的文件，这里用简单方式
-        shard_suffix = f"{chr(ord('a') + i // 26)}{chr(ord('a') + i % 26)}"
-        gcs_shard_path = f"gs://{gcs_bucket}/{GCS_SHARD_PREFIX}{shard_suffix}"
-        # gcs_shard_path = f"gs://zyj-paper-cdn/url-shards/url_test.txt"
-
-        # 将GCS路径和区域动态插入到启动脚本模板中
-        startup_script = startup_script_template.format(
-            shard_suffix = shard_suffix,
-            gcs_url_list_path = gcs_shard_path,
-            region = region
-        )
-
-        vm_name = f"prewarm-worker-{i:02d}" # 例如: prewarm-worker-00
-        
-        instance = gcp.compute.Instance(resource_name=vm_name+'-'+region,
-            machine_type=type,
-            zone=region+"-b",
-            boot_disk=gcp.compute.InstanceBootDiskArgs(
-                initialize_params=gcp.compute.InstanceBootDiskInitializeParamsArgs(
-                    image="debian-cloud/debian-11",
-                    size=30 # 适当增加磁盘大小
-                ),
-            ),
-            network_interfaces=[gcp.compute.InstanceNetworkInterfaceArgs(
-                network="default",
-                access_configs=[gcp.compute.InstanceNetworkInterfaceAccessConfigArgs()],
-            )],
-            metadata={"startup-script": startup_script},
-            service_account=gcp.compute.InstanceServiceAccountArgs(
-                email=config.require('service_account_email'),
-                scopes=["cloud-platform"],
-            ),
-            # 在这里应用自定义超时选项
-            opts=pulumi.ResourceOptions(custom_timeouts=long_timeout)
-        )
-        pulumi.export('instance_name', instance.name)
-
-exclude_regions = ["me-central2"]
-region_list = gcp.compute.get_regions()
-
-# for region in region_list.names:
-#     # 在创建VM之前，检查当前区域是否在排除列表中
-#     if region not in exclude_regions:
-#         create_vm(region, type)
-#     else:
-#         # (可选) 打印一条信息，让你知道哪个区域被跳过了
-#         print(f"Skipping region {region} as it is in the exclusion list.")
-
-create_vm("us-central1", type)
-
-pulumi.export("message", f"Scheduled creation for {num_vms} worker VMs.")
