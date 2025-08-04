@@ -1,4 +1,0 @@
-config:
-  cdn_prewarm:name: pp-dev
-  cdn_prewarm:type: e2-medium
-  gcp:project: tidal-memento-371114
