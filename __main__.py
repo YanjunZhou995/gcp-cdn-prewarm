@@ -23,7 +23,22 @@ set -e
 
 # 更新软件包列表并安装必要的工具。
 # -y 选项会自动确认所有安装提示。
-sudo apt-get update
+# 增加一个循环，最多重试3次来执行 apt-get update
+for i in {{1..3}}; do
+    echo "--- [Attempt $i/3] Running apt-get update... ---"
+    if sudo apt-get update; then
+        echo "--- apt-get update successful! ---"
+        break # 如果成功，就跳出循环
+    fi
+
+    if [ $i -lt 3 ]; then
+        echo "--- apt-get update failed. Retrying in 15 seconds... ---"
+        sleep 15 # 等待15秒再重试
+    else
+        echo "--- ERROR: apt-get update failed after 3 attempts. ---"
+        exit 1 # 3次都失败了，则让脚本以失败状态退出
+    fi
+done
 sudo apt-get install -y curl parallel jq
 
 # --- 变量定义 ---
@@ -79,8 +94,10 @@ fi
 echo "--- DEBUG 1: Final JSON Payload ---"
 
 readonly TOTAL_URLS=$(grep -c . "$URL_LIST_FILE")
+readonly TOTAL_REQUESTS=$((TOTAL_URLS * 3)) # 新增：定义总请求数
 echo "TOTAL_URLS = $TOTAL_URLS"
-log_to_gcp "URL list downloaded successfully." "INFO" '{{"vm_name": "'$(hostname)'", "region": "{region}", "task_id":"{shard_suffix}", "total_urls": '$TOTAL_URLS'}}'
+echo "TOTAL_REQUESTS = $TOTAL_REQUESTS" # 新增：打印总请求数
+log_to_gcp "URL list downloaded successfully." "INFO" '{{"vm_name": "'$(hostname)'", "region": "{region}", "task_id":"{shard_suffix}", "total_urls": '$TOTAL_URLS', "total_requests": '$TOTAL_REQUESTS'}}'
 
 echo "--- DEBUG 1.5: Final JSON Payload ---"
 
@@ -88,33 +105,45 @@ echo "--- DEBUG 1.5: Final JSON Payload ---"
 #    这个函数会被'parallel'命令并行调用。
 process_url() {{
     local url="$1"
-    # 设置60秒超时，-L跟随重定向，-s静默模式，-o将下载内容丢弃，-w获取最终的HTTP状态码。
-    http_code=$(curl -L -s -o /dev/null -w "%{{http_code}}" --max-time 60 "$url")
+    local total_attempts=3
+
+    for (( i=1; i<=total_attempts; i++ )); do
+        # 设置60秒超时，-L跟随重定向，-s静默模式，-o将下载内容丢弃，-w获取最终的HTTP状态码。
+        http_code=$(curl -L -s -o /dev/null -w "%{{http_code}}" --max-time 60 "$url")
     
-    # 检查HTTP状态码是否为2xx或3xx（通常表示成功或重定向成功）。
-    if [[ "$http_code" =~ ^[23] ]]; then
-        echo "$url" >> "$SUCCESS_LOG"
-    else
-        # 将失败的URL同时记录到本地文件和Cloud Logging。
-        echo "$url" >> "$FAILURE_LOG"
+        # 检查HTTP状态码是否为2xx或3xx（通常表示成功或重定向成功）。
+        if [[ "$http_code" =~ ^[23] ]]; then
+            echo "$url" >> "$SUCCESS_LOG"
+        else
+            # 将失败的URL同时记录到本地文件和Cloud Logging。
+            echo "$url" >> "$FAILURE_LOG"
         
-        local extra_payload
-        extra_payload=$(jq -n \
-          --arg vm_name "$(hostname)" \
-          --arg region {region} \
-          --arg task_id {shard_suffix} \
-          --arg url "$url" \
-          --arg http_code "$http_code" \
-          '{{
-            "vm_name": $vm_name,
-            "region": $region,
-            "task_id": $task_id,
-            "url": $url,
-            "http_code": ($http_code | tonumber)
-          }}')
-        
-        log_to_gcp "Request failed for URL." "WARNING" "$extra_payload"
-    fi
+            # 为当次失败发送详细日志到Cloud Logging
+            local extra_payload
+            extra_payload=$(jq -n \
+              --arg vm_name "$(hostname)" \
+              --arg region {region} \
+              --arg task_id {shard_suffix} \
+              --arg url "$url" \
+              --arg http_code "$http_code" \
+              --arg attempt_num "$i" \
+              '{{
+                "vm_name": $vm_name,
+                "region": $region,
+                "task_id": $task_id,
+                "url": $url,
+                "http_code": ($http_code | tonumber),
+                "attempt_num": ($attempt_num | tonumber)
+              }}')
+
+            log_to_gcp "Request failed for URL." "WARNING" "$extra_payload"
+        fi
+
+        # 在两次请求之间短暂休息1秒，避免对服务器造成过大压力
+        if [[ $i -lt $total_attempts ]]; then
+            sleep 1
+        fi
+    done
 }}
 # 将函数导出，以便'parallel'可以调用它。
 export LOG_NAME
@@ -142,7 +171,7 @@ SUCCESS_COUNT=$(cat "$SUCCESS_LOG" 2>/dev/null | wc -l || echo 0)
 FAILURE_COUNT=$(cat "$FAILURE_LOG" 2>/dev/null | wc -l || echo 0)
 
 # 使用awk进行浮点数计算，避免shell的整数除法问题。
-COMPLETION_RATE=$(awk -v total="$TOTAL_URLS" -v success="$SUCCESS_COUNT" -v failure="$FAILURE_COUNT" \
+COMPLETION_RATE=$(awk -v total="$TOTAL_REQUESTS" -v success="$SUCCESS_COUNT" -v failure="$FAILURE_COUNT" \
   'BEGIN {{
     if (total > 0) {{
         printf "%.2f", ((success + failure) / total) * 100
@@ -151,7 +180,7 @@ COMPLETION_RATE=$(awk -v total="$TOTAL_URLS" -v success="$SUCCESS_COUNT" -v fail
     }}
   }}')
 
-SUCCESS_RATE=$(awk -v total="$TOTAL_URLS" -v success="$SUCCESS_COUNT" \
+SUCCESS_RATE=$(awk -v total="$TOTAL_REQUESTS" -v success="$SUCCESS_COUNT" \
   'BEGIN {{
     if (total > 0) {{
         printf "%.2f", (success / total) * 100
@@ -286,6 +315,8 @@ region_list = gcp.compute.get_regions()
 #         # (可选) 打印一条信息，让你知道哪个区域被跳过了
 #         print(f"Skipping region {region} as it is in the exclusion list.")
 
-create_vm("us-central1", type)
+# create_vm("us-central1", type)
+# create_vm("europe-north1", type)
+create_vm("asia-east1", type)
 
 pulumi.export("message", f"Scheduled creation for {num_vms} worker VMs.")

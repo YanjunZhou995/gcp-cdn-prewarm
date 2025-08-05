@@ -1,0 +1,6 @@
+config:
+  cdn_prewarm:type: e2-standard-4
+  cdn_prewarm:num_vms: 1
+  cdn_prewarm:gcs_bucket: longxin_sieger_gcs/paper
+  cdn_prewarm:service_account_email: sa-vm-prewarm-manual@sieger-lx-project.iam.gserviceaccount.com
+  gcp:project: sieger-lx-project  
