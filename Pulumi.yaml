@@ -1,6 +1,9 @@
-name: cdn_prewarm
-runtime:
-  name: python
-  options:
-    virtualenv: venv
-description: A minimal Google Cloud Python Pulumi program
+config:
+  cdn_prewarm:type: e2-standard-4
+  cdn_prewarm:num_vms: 2
+  cdn_prewarm:total_attempts: 3
+  cdn_prewarm:gcs_bucket_name: zyj-paper-cdn # 改为存储桶名称
+  cdn_prewarm:gcs_url_list_path: "url-dir/urls_1k.txt" # 源文件在桶内的路径
+  cdn_prewarm:gcs_shard_output_dir: "url-dir" # 在桶内的存放分片的目录
+  cdn_prewarm:service_account_email: sa-vm-prewarm-manual@tidal-memento-371114.iam.gserviceaccount.com
+  gcp:project: tidal-memento-371114
