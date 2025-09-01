@@ -389,11 +389,7 @@ log_to_gcp "Cleanup complete. Script finished." "INFO" '{{"vm_name": "'$(hostnam
 # gcloud compute instances delete "$(hostname)" --zone="{{zone}}" --quiet
 '''
 
-
-
-
-
-# --- 循环创建10台工作虚拟机 ---
+# --- 循环创建num_vms台工作虚拟机 ---
 def create_vm(region, type):
     # 3. 循环创建虚拟机
     # 这个循环会根据num_vms配置的数量来执行
